@@ -188,8 +188,11 @@ class LinkReaderPlugin(Star):
             keyword = re.sub(r'( - .*| \| .*)$', '', keyword)
             logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
 
+            target_sites = ["lyrics.net.cn", "xiaojiangclub.com", "ufanv.cn", "geciyi.com"]
+            site_query = " OR ".join([f"site:{site}" for site in target_sites])
+
             # 第二步：使用 DuckDuckGo 搜索
-            search_query = f"{keyword}"
+            search_query = f"{keyword}({site_query})"
             results_text = []
             
             # 适配最新版 duckduckgo_search API
