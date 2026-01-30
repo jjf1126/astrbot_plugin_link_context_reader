@@ -185,14 +185,11 @@ class LinkReaderPlugin(Star):
                 keyword = url
 
             # 优化关键词提取：保留歌曲名和歌手
-            keyword = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*)$', '', keyword).strip()
-            # 进一步尝试只保留曲名 (处理 "曲名 - 歌手" 格式)
-            pure_song_name = re.sub(r' - .*$', '', keyword).strip()
-            
-            logger.info(f"[LinkReader] 识别音乐链接，原始关键词: {keyword}，搜索曲名: {pure_song_name}")
+            keyword = re.sub(r'( - .*| \| .*)$', '', keyword)
+            logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
 
-            # 搜索关键词改为：曲名 歌词
-            search_query = f"{pure_song_name} 歌词"
+            # 第二步：使用 DuckDuckGo 搜索
+            search_query = f"{keyword} 歌词"
             results_text = []
             
             # 适配最新版 duckduckgo_search API
