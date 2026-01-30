@@ -100,10 +100,10 @@ class LinkContextReader(Star):
                 content=parse_result.get("content", "")
             )
 
-            # 6. 注入到 System Prompt
-            # 也可以选择追加到 req.text 或 context 中，这里选择追加到 system_prompt 以作为背景知识
-            original_sys_prompt = req.system_prompt or ""
-            req.system_prompt = f"{original_sys_prompt}\n\n{injection_text}"
+            # 6. 注入到req.text
+            # 也可以选择追加到 System Prompt 或 context 中，这里选择追加到 req.text
+            original_text = req.text or ""
+            req.text = f"{injection_text}\n\n[用户原话]: {original_text}"
             
             logger.info(f"[LinkReader] Successfully injected content from {target_url}")
 
