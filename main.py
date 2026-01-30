@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持多平台音乐 ID 直连及更智能的歌词搜索。", "1.5.2")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持全平台音乐短链追踪及深度歌词解析。", "1.6.0")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -64,8 +64,19 @@ class LinkReaderPlugin(Star):
         return headers
 
     def _is_music_site(self, url: str) -> bool:
-        """判断是否为音乐网站"""
-        music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "163cn.tv", "url.cn", "163.fm"]
+        """全平台音乐域名识别（含各类短链域名）"""
+        music_domains = [
+            # 网易云
+            "music.163.com", "163cn.tv", "163.fm", "y.music.163.com",
+            # QQ 音乐
+            "y.qq.com", "c6.y.qq.com", "c.y.qq.com", "u.y.qq.com", "url.cn",
+            # 酷狗
+            "kugou.com", "t.kugou.com", "fanxing.kugou.com",
+            # 酷我
+            "kuwo.cn", "t.kuwo.cn",
+            # 咪咕/B站音乐等
+            "migu.cn", "b23.tv"
+        ]
         return any(domain in url for domain in music_domains)
 
     def _contains_chinese(self, text: str) -> bool:
@@ -84,17 +95,13 @@ class LinkReaderPlugin(Star):
         for line in lines:
             line = line.strip()
             if not line: continue
-            # 去除时间标签 [00:00.00]
             line = re.sub(r'\[\d+:\d+\.\d+\]', '', line).strip()
-            # 去除 [id:xxx] 等标签
             if not line or (line.startswith('[') and line.endswith(']')): continue
             
-            # 过滤掉常见的作词作曲信息行
-            if ((':' in line or '：' in line) and len(line) < 30) or ' - ' in line:
-                if not any(kw in line for kw in ["歌词", "Lyric", "LRC"]):
+            if ((':' in line or '：' in line) and len(line) < 35) or ' - ' in line:
+                if not any(kw in line for kw in ["歌词", "Lyric", "LRC", "文本"]):
                     continue
             
-            # 汉字歌词空格拆分逻辑
             if ' ' in line and self._contains_chinese(line):
                 parts = [part.strip() for part in line.split(' ') if part.strip()]
                 if all(len(part) < 20 for part in parts):
@@ -122,16 +129,22 @@ class LinkReaderPlugin(Star):
         return result
 
     async def _handle_music_direct_api(self, url: str) -> str:
-        """音乐直连解析入口"""
+        """音乐直连解析入口：支持全平台短链追踪"""
         try:
             async with aiohttp.ClientSession() as session:
-                # 1. 短链接跳转处理
+                # 1. 全平台短链接追踪 (Redirection Tracking)
                 final_url = url
-                if any(domain in url for domain in ["163cn.tv", "url.cn", "163.fm"]):
-                    async with session.head(url, allow_redirects=True, timeout=5) as resp:
+                short_link_domains = [
+                    "163cn.tv", "163.fm", "url.cn", "c6.y.qq.com", 
+                    "u.y.qq.com", "t.kugou.com", "t.kuwo.cn", "b23.tv"
+                ]
+                if any(domain in url for domain in short_link_domains) or "base/fcgi-bin/u" in url:
+                    headers = {"User-Agent": self.user_agent}
+                    async with session.head(url, allow_redirects=True, timeout=8, headers=headers) as resp:
                         final_url = str(resp.url)
+                        logger.info(f"[LinkReader] 短链重定向成功: {url} -> {final_url}")
 
-                # --- 平台适配: 网易云 ---
+                # --- 平台解析: 网易云 ---
                 if "music.163.com" in final_url:
                     id_match = re.search(r'id=(\d+)', final_url) or re.search(r'song/(\d+)', final_url)
                     if id_match:
@@ -139,17 +152,16 @@ class LinkReaderPlugin(Star):
                         api_url = f"https://music.163.com/api/song/lyric?id={song_id}&lv=-1&tv=-1"
                         headers = {"Referer": "https://music.163.com/", "Cookie": "os=pc", "User-Agent": self.user_agent}
                         async with session.get(api_url, headers=headers) as resp:
-                            # 修复: 强制读取文本并手动解析 JSON，绕过 mimetype 校验
                             text = await resp.text()
                             data = json.loads(text)
                             lrc = data.get("lrc", {}).get("lyric", "")
                             tlrc = data.get("tlyric", {}).get("lyric", "")
                             if lrc:
-                                res = f"【网易云直连解析】\n\n{self._filter_lyrics(lrc)}"
+                                res = f"【网易云解析 (ID: {song_id})】\n\n{self._filter_lyrics(lrc)}"
                                 if tlrc: res += f"\n\n【翻译】\n{self._filter_lyrics(tlrc)}"
                                 return res
 
-                # --- 平台适配: QQ 音乐 ---
+                # --- 平台解析: QQ 音乐 ---
                 elif "y.qq.com" in final_url:
                     mid_match = re.search(r'songmid=([a-zA-Z0-9]+)', final_url) or re.search(r'songDetail/([a-zA-Z0-9]+)', final_url)
                     if mid_match:
@@ -161,10 +173,10 @@ class LinkReaderPlugin(Star):
                             try:
                                 data = json.loads(re.sub(r'^\w+\(|\)$', '', text))
                                 lrc = data.get("lyric", "")
-                                if lrc: return f"【QQ音乐直连解析】\n\n{self._filter_lyrics(lrc)}"
+                                if lrc: return f"【QQ音乐解析 (MID: {mid})】\n\n{self._filter_lyrics(lrc)}"
                             except: pass
 
-                # --- 平台适配: 酷我音乐 ---
+                # --- 平台解析: 酷我音乐 ---
                 elif "kuwo.cn" in final_url:
                     id_match = re.search(r'mid=(\d+)', final_url) or re.search(r'musicId=(\d+)', final_url)
                     if id_match:
@@ -176,50 +188,51 @@ class LinkReaderPlugin(Star):
                             lrc_list = data.get("data", {}).get("lrclist", [])
                             if lrc_list:
                                 lrc_text = "\n".join([i['lineLyric'] for i in lrc_list])
-                                return f"【酷我音乐直连解析】\n\n{lrc_text}"
+                                return f"【酷我音乐解析】\n\n{lrc_text}"
 
-                # 直连失败或未适配平台，触发兜底搜索
+                # 无法直连则进入兜底搜索
                 return await self._fallback_xiaojiang_search(final_url)
 
         except Exception as e:
-            logger.error(f"[LinkReader] 音乐 API 解析异常: {e}")
+            logger.error(f"[LinkReader] 音乐 API 直连异常: {e}")
             return await self._fallback_xiaojiang_search(url)
 
     async def _fallback_xiaojiang_search(self, url: str) -> str:
-        """兜底逻辑：获取标题并在 xiaojiangclub.com 搜索第一个结果"""
+        """关键词精简兜底搜索"""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers={"User-Agent": self.user_agent}, timeout=5) as resp:
+                async with session.get(url, headers={"User-Agent": self.user_agent}, timeout=8) as resp:
                     soup = BeautifulSoup(await resp.text(errors='ignore'), 'lxml')
                     title = soup.title.string.strip() if soup.title else "未知歌曲"
             
-            # --- 精简关键词逻辑 ---
-            # 1. 移除特定的后缀
-            song_name = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*| - 歌曲.*| - 单曲)$', '', title).strip()
-            song_name = re.sub(r'^歌曲：', '', song_name)
+            # 1. 基础清洗：移除平台后缀
+            song_name = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*| - 歌曲.*| - 单曲| - 专辑| - 咪咕音乐)$', '', title).strip()
+            song_name = re.sub(r'^(歌曲|单曲|分享|正在播放)：', '', song_name)
             
-            # 2. 强力过滤：移除所有括号内的信息 (周年曲、游戏名、推广语等)
-            song_name = re.sub(r'[（《\(【].*?[）》\)】]', '', song_name).strip()
+            # 2. 深度清洗：移除括号、周年曲等装饰性内容
+            clean_name = re.sub(r'[（《\(【].*?[）》\)】]', '', song_name).strip()
             
-            # 3. 移除多歌手列表 (只留第一个歌手或纯歌名)
-            if ' - ' in song_name:
-                song_name = song_name.split(' - ')[0].strip()
+            # 3. 歌手拆分：取第一个 '-' 前后的核心部分
+            if ' - ' in clean_name:
+                parts = clean_name.split(' - ')
+                # 优先保留歌名，若第一部分太短（如符号）则取第二部分
+                clean_name = parts[0].strip() if len(parts[0].strip()) > 1 else parts[1].strip()
             
-            # 4. 如果过滤后太短，回退到第一个短横杠前的核心
-            if not song_name or len(song_name) < 1:
-                song_name = title.split('-')[0].strip()
+            # 4. 安全校验：防止搜出空字符串或纯符号
+            final_keyword = clean_name if len(re.sub(r'[^\w\u4e00-\u9fff]', '', clean_name)) >= 1 else song_name
+            if not final_keyword: final_keyword = title[:15]
 
-            logger.info(f"[LinkReader] 正在尝试精简后的关键词搜索: {song_name}")
-            content = await self._search_xiaojiang(song_name)
+            logger.info(f"[LinkReader] 触发兜底搜索，关键词: {final_keyword}")
+            content = await self._search_xiaojiang(final_keyword)
             
             if content:
-                return f"【歌词解析: {song_name}】\n来源: 小江音乐网\n\n{content}"
-            return f"识别到歌曲链接，但在自动搜索《{song_name}》时未能匹配到歌词正文。"
+                return f"【歌词解析: {final_keyword}】\n来源: 小江音乐网\n\n{content}"
+            return f"识别到音乐链接，但在搜索《{final_keyword}》时未能匹配到歌词正文。"
         except Exception:
             return "音乐链接解析失败。"
 
     async def _search_xiaojiang(self, song_name: str) -> Optional[str]:
-        """根据截图逻辑：定位 a.song-link 并拼接前缀获取歌词"""
+        """小江音乐网搜索逻辑"""
         search_url = f"https://xiaojiangclub.com/?s={quote(song_name)}"
         base_domain = "https://xiaojiangclub.com"
         headers = {"User-Agent": self.user_agent}
@@ -229,29 +242,22 @@ class LinkReaderPlugin(Star):
                     if resp.status != 200: return None
                     soup = BeautifulSoup(await resp.text(), 'lxml')
                     
-                    # 查找包含 song-link 类的第一个 a 标签
                     target_link_tag = soup.find('a', class_='song-link', href=True)
-                    if not target_link_tag:
-                        return None
+                    if not target_link_tag: return None
                     
                     target_path = target_link_tag['href']
                     target_link = target_path if target_path.startswith("http") else base_domain + target_path
                     
-                    logger.info(f"[LinkReader] 正在访问搜索结果页: {target_link}")
                     async with session.get(target_link, headers=headers, timeout=10) as l_resp:
                         l_soup = BeautifulSoup(await l_resp.text(), 'lxml')
+                        container = l_soup.find('div', class_='entry-content') or l_soup.find('article') or l_soup.find('div', class_='post-content')
+                        if not container: container = l_soup
                         
-                        # 定位 WordPress 常见的正文容器
-                        content_container = l_soup.find('div', class_='entry-content') or l_soup.find('article') or l_soup.find('div', class_='post-content')
-                        if not content_container: content_container = l_soup
-                        
-                        for tag in content_container(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'button']):
+                        for tag in container(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'button']):
                             tag.decompose()
                             
-                        raw_text = content_container.get_text(separator='\n', strip=True)
-                        return self._filter_lyrics(raw_text)
-        except Exception as e:
-            logger.error(f"[LinkReader] Xiaojiang 搜索解析异常: {e}")
+                        return self._filter_lyrics(container.get_text(separator='\n', strip=True))
+        except: pass
         return None
 
     async def _get_screenshot_and_content(self, url: str):
@@ -279,20 +285,14 @@ class LinkReaderPlugin(Star):
         
         domain = urlparse(url).netloc
         social_platforms = ["xiaohongshu.com", "zhihu.com", "weibo.com", "bilibili.com", "douyin.com", "lofter.com"]
-        
         if any(sp in domain for sp in social_platforms) and HAS_PLAYWRIGHT:
             html, screenshot = await self._get_screenshot_and_content(url)
             if html:
                 soup = BeautifulSoup(html, 'lxml')
                 for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe']): tag.decompose()
-                if "xiaohongshu.com" in url:
-                    content_div = soup.find(class_=re.compile(r'desc|note-content|text'))
-                    content = content_div.get_text(separator='\n', strip=True) if content_div else soup.get_text(separator='\n', strip=True)
-                else:
-                    content = soup.get_text(separator='\n', strip=True)
+                content = soup.get_text(separator='\n', strip=True)
                 return self._clean_text(content), screenshot
 
-        # 常规网页抓取
         headers = self._get_headers(domain)
         try:
             async with aiohttp.ClientSession() as session:
@@ -316,26 +316,26 @@ class LinkReaderPlugin(Star):
         if content:
             req.prompt += self.prompt_template.format(content=content)
             if screenshot_base64:
-                req.prompt += f"\n(附带页面截图参考)\n图片：data:image/jpeg;base64,{screenshot_base64}"
-            logger.info(f"[LinkReader] 内容已成功注入 Prompt")
+                req.prompt += f"\n(附带页面截图)\n图片：data:image/jpeg;base64,{screenshot_base64}"
+            logger.info(f"[LinkReader] 成功注入链接内容")
 
     @filter.command("link_debug")
     async def link_debug(self, event: AstrMessageEvent, url: str):
         """调试指令"""
         if not url: return
-        yield event.plain_result(f"🔍 正在进行多模式深度解析: {url}...")
+        yield event.plain_result(f"🔍 正在深度解析链接: {url}...")
         content, screenshot = await self._fetch_url_content(url)
         msg = f"【解析正文内容】:\n{content}"
-        if screenshot: msg += "\n\n(已成功捕获视觉截图)"
         yield event.plain_result(msg)
 
     @filter.command("link_status")
     async def link_status(self, event: AstrMessageEvent):
-        """插件状态检查"""
-        status_msg = ["【Link Reader 插件状态报告】"]
-        status_msg.append(f"插件运行: {'✅ 正常'}")
-        status_msg.append(f"直连 API Mimetype 修复: ✅ 已启用 (json.loads)")
-        status_msg.append(f"搜索关键词精简: ✅ 已启用 (正则脱敏)")
-        status_msg.append(f"智能兜底源: xiaojiangclub.com")
-        status_msg.append(f"Playwright 截图: {'✅ 已加载' if HAS_PLAYWRIGHT else '❌ 未就绪'}")
-        yield event.plain_result("\n".join(status_msg))
+        """状态检查"""
+        msg = [
+            "【Link Reader 1.6.0 状态报告】",
+            "全平台短链追踪: ✅ (163/QQ/Kugou/Kuwo/Bili)",
+            "音乐直连 API: ✅ (网易/QQ/酷我)",
+            "智能精简搜索: ✅ (XiaojiangClub)",
+            f"正文最大长度: {self.max_length}"
+        ]
+        yield event.plain_result("\n".join(msg))
