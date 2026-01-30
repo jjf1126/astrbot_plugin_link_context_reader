@@ -95,7 +95,7 @@ class LinkReaderPlugin(Star):
 
     def _is_music_site(self, url: str) -> bool:
         """判断是否为音乐网站"""
-        music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "spotify.com"]
+        music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "spotify.com", "163cn.tv"]
         return any(domain in url for domain in music_domains)
 
     def _clean_text(self, text: str) -> str:
