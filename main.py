@@ -4,7 +4,7 @@ import traceback
 import base64
 import json
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import urlparse, quote, parse_qs
+from urllib.parse import urlparse, quote
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "终极修复小红书导航栏清洗，支持系统依赖缺失预警与深度正文提取。", "1.8.2")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "适配 Aiocqhttp 修复异常，强化小红书页脚备案信息清洗。", "1.8.3")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -30,11 +30,11 @@ class LinkReaderPlugin(Star):
         self.enable_plugin = self.general_config.get("enable_plugin", True)
         self.max_length = self.general_config.get("max_content_length", 2000)
         self.timeout = self.general_config.get("request_timeout", 15)
-        self.user_agent = self.general_config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        self.prompt_template = self.general_config.get("prompt_template", "\n【链接正文如下】：\n{content}\n")
+        self.user_agent = self.general_config.get("user_agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
+        self.prompt_template = self.general_config.get("prompt_template", "\n【链接解析内容】：\n{content}\n")
 
     def _is_music_site(self, url: str) -> bool:
-        return any(domain in url for domain in ["music.163.com", "163cn.tv", "163.fm", "y.music.163.com"])
+        return any(domain in url for domain in ["music.163.com", "163cn.tv", "163.fm"])
 
     def _filter_lyrics(self, lyrics: str) -> str:
         if not lyrics: return ""
@@ -46,97 +46,81 @@ class LinkReaderPlugin(Star):
             filtered.append(line)
         return '\n'.join(filtered)
 
-    def _clean_text(self, text: str) -> str:
-        """深度清洗：增加对小红书导航栏的暴力过滤"""
-        # 移除这些特定的导航和冗余词汇
+    def _clean_text(self, text: str, is_xhs: bool = False) -> str:
+        """深度清洗：针对小红书进行切片处理"""
+        if is_xhs:
+            # 策略：寻找最后一个“电话：9501-3888”标记，并切除其及之前的内容
+            marker = "电话：9501-3888"
+            if marker in text:
+                text = text.split(marker)[-1].strip()
+            
+            # 进一步过滤“更多”、“关注”等紧跟在博主名字后的干扰项
+            text = re.sub(r'^(更多\n|关注\n|创作中心\n|业务合作\n)+', '', text, flags=re.MULTILINE)
+
         blacklist = [
-            "创作中心", "业务合作", "发现", "发布", "通知", "登录", "注册",
-            "营业执照", "医疗器械", "网上有害信息", "违法不良信息", "加载中",
-            "沪ICP备", "公网安备", "版权所有", "©", "Copyright", "地址：", "电话：", "更多", "关注"
+            "沪ICP备", "公网安备", "经营许可证", "版权所有", "©", "Copyright", "加载中",
+            "医疗器械", "网信算备", "资格证书", "上海市互联网举报中心", "违法不良信息", "登录", "发现"
         ]
-        
         lines = text.split('\n')
-        cleaned_lines = []
+        cleaned = []
         for line in lines:
             line = line.strip()
-            if not line or len(line) < 1 or any(kw == line for kw in blacklist):
-                continue
-            # 过滤包含备案号的行
-            if re.search(r'备字\[\d+\]|网信算备|资格证书', line):
-                continue
-            cleaned_lines.append(line)
+            if not line or len(line) < 1 or any(kw in line for kw in blacklist): continue
+            cleaned.append(line)
         
-        result = '\n'.join(cleaned_lines)
+        result = '\n'.join(cleaned)
         return result[:self.max_length]
-
-    async def _handle_music_direct_api(self, url: str) -> str:
-        try:
-            async with aiohttp.ClientSession() as session:
-                final_url = url
-                if "163" in url:
-                    async with session.head(url, allow_redirects=True, timeout=8) as resp:
-                        final_url = str(resp.url)
-                id_match = re.search(r'id=(\d+)', final_url) or re.search(r'song/(\d+)', final_url)
-                if id_match:
-                    api_url = f"https://music.163.com/api/song/lyric?id={id_match.group(1)}&lv=-1&tv=-1"
-                    async with session.get(api_url, headers={"Referer": "https://music.163.com/", "User-Agent": self.user_agent}) as resp:
-                        data = json.loads(await resp.text())
-                        lrc = data.get("lrc", {}).get("lyric", "")
-                        if lrc: return f"【网易云解析】\n\n{self._filter_lyrics(lrc)}"
-                return "未找到网易云直连歌词。"
-        except: return "音乐解析失败。"
 
     async def _get_screenshot_and_content(self, url: str):
         if not HAS_PLAYWRIGHT: return None, None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-                    viewport={'width': 390, 'height': 844}
-                )
+                browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                context = await browser.new_context(user_agent=self.user_agent, viewport={'width': 390, 'height': 844})
                 page = await context.new_page()
                 await page.goto(url, wait_until='networkidle', timeout=30000)
-                await asyncio.sleep(4) # 延长等待确保 JS 渲染完毕
+                await asyncio.sleep(4)
                 content = await page.content()
-                screenshot_bytes = await page.screenshot(type='jpeg', quality=85)
+                screenshot_bytes = await page.screenshot(type='jpeg', quality=80)
                 screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
                 await browser.close()
                 return content, screenshot_base64
         except Exception as e:
-            logger.error(f"[LinkReader] 截图失败 (请检查系统依赖): {e}")
+            logger.error(f"[LinkReader] 浏览器组件异常: {e}")
             return None, None
 
     async def _fetch_url_content(self, url: str):
-        if self._is_music_site(url):
-            return await self._handle_music_direct_api(url), None
-        
         domain = urlparse(url).netloc
         is_xhs = any(sp in domain for sp in ["xiaohongshu.com", "xhslink.com"])
         
-        if (is_xhs or "zhihu.com" in domain or "weibo.com" in domain) and HAS_PLAYWRIGHT:
+        # 针对音乐网站
+        if self._is_music_site(url):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url, allow_redirects=True, timeout=5) as r:
+                        f_url = str(r.url)
+                    id_match = re.search(r'id=(\d+)', f_url)
+                    if id_match:
+                        api = f"https://music.163.com/api/song/lyric?id={id_match.group(1)}&lv=-1&tv=-1"
+                        async with session.get(api, headers={"Referer": "https://music.163.com/"}) as resp:
+                            data = json.loads(await resp.text())
+                            return self._filter_lyrics(data.get("lrc", {}).get("lyric", "")), None
+            except: pass
+
+        # 针对社交平台采用截图
+        if (is_xhs or "zhihu.com" in domain) and HAS_PLAYWRIGHT:
             html, screenshot = await self._get_screenshot_and_content(url)
             if html:
                 soup = BeautifulSoup(html, 'lxml')
-                # 暴力清理小红书导航
-                for nav in soup.select('nav, footer, .header, .footer, .sidebar'): nav.decompose()
-                
-                final_text = ""
-                if is_xhs:
-                    # 1. 尝试直接抓取正文 div
-                    main_content = soup.find(class_=re.compile(r'note-content|desc|note-text'))
-                    if main_content:
-                        # 抓取博主名 + 正文
-                        author = soup.find(class_=re.compile(r'author|user-name|nickname'))
-                        author_text = f"博主：{author.get_text(strip=True)}\n" if author else ""
-                        final_text = author_text + main_content.get_text(separator='\n', strip=True)
-                
-                if not final_text:
-                    final_text = soup.get_text(separator='\n', strip=True)
-                
-                return self._clean_text(final_text), screenshot
+                # 针对小红书正文 DOM 定向提取
+                content_node = soup.find(class_=re.compile(r'note-content|desc'))
+                if content_node:
+                    text = content_node.get_text(separator='\n', strip=True)
+                else:
+                    text = soup.get_text(separator='\n', strip=True)
+                return self._clean_text(text, is_xhs=is_xhs), screenshot
 
-        # 常规网页
+        # 常规抓取
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as resp:
@@ -153,27 +137,29 @@ class LinkReaderPlugin(Star):
         if content:
             req.prompt += self.prompt_template.format(content=content)
             if screenshot_base64:
-                req.prompt += f"\n(图片内容已通过视觉组件捕获)\n图片：data:image/jpeg;base64,{screenshot_base64}"
+                req.prompt += f"\n(附带截图: data:image/jpeg;base64,{screenshot_base64})"
 
     @filter.command("link_debug")
     async def link_debug(self, event: AstrMessageEvent, url: str):
         if not url: return
-        yield event.plain_result(f"🔍 深度解析 v1.8.2: {url}")
+        yield event.plain_result(f"🔍 深度解析 v1.8.3: {url}")
         content, screenshot_base64 = await self._fetch_url_content(url)
         
+        # 修复 Aiocqhttp 没有 chain() 的问题：分开发送
         if screenshot_base64:
-            from astrbot.api.message_components import Image
-            yield event.chain().append(Image.from_base64(screenshot_base64)).text(f"\n【清洗后的正文】:\n{content}").build()
-        else:
-            yield event.plain_result(f"⚠️ 截图失败(请安装系统依赖)\n【清洗后的正文】:\n{content}")
+            try:
+                yield event.image_result(screenshot_base64)
+            except Exception as e:
+                yield event.plain_result(f"❌ 图片发送失败: {e}")
+        
+        yield event.plain_result(f"【清洗后的正文】:\n{content}")
 
     @filter.command("link_status")
     async def link_status(self, event: AstrMessageEvent):
         msg = [
-            "【Link Reader 1.8.2 状态报告】",
-            "网易云: ✅",
-            "小红书: ✅ (正文 DOM 定向提取)",
-            f"截图支持: {'✅ 正常' if HAS_PLAYWRIGHT else '❌ 未就绪'}",
-            "提示: 若截图失败请运行 playwright install-deps"
+            "【Link Reader 1.8.3 状态】",
+            "网易云解析: ✅",
+            "小红书清洗: ✅ (末尾锚点法)",
+            f"截图组件: {'✅ 正常' if HAS_PLAYWRIGHT else '❌ 缺失'}"
         ]
         yield event.plain_result("\n".join(msg))
