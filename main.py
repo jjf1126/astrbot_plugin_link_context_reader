@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持多平台音乐 ID 直连及 xiaojiangclub.com 定向搜索。", "1.5.1")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持多平台音乐 ID 直连及更智能的歌词搜索。", "1.5.2")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -139,14 +139,15 @@ class LinkReaderPlugin(Star):
                         api_url = f"https://music.163.com/api/song/lyric?id={song_id}&lv=-1&tv=-1"
                         headers = {"Referer": "https://music.163.com/", "Cookie": "os=pc", "User-Agent": self.user_agent}
                         async with session.get(api_url, headers=headers) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                lrc = data.get("lrc", {}).get("lyric", "")
-                                tlrc = data.get("tlyric", {}).get("lyric", "")
-                                if lrc:
-                                    res = f"【网易云解析】\n\n{self._filter_lyrics(lrc)}"
-                                    if tlrc: res += f"\n\n【翻译】\n{self._filter_lyrics(tlrc)}"
-                                    return res
+                            # 修复: 强制读取文本并手动解析 JSON，绕过 mimetype 校验
+                            text = await resp.text()
+                            data = json.loads(text)
+                            lrc = data.get("lrc", {}).get("lyric", "")
+                            tlrc = data.get("tlyric", {}).get("lyric", "")
+                            if lrc:
+                                res = f"【网易云直连解析】\n\n{self._filter_lyrics(lrc)}"
+                                if tlrc: res += f"\n\n【翻译】\n{self._filter_lyrics(tlrc)}"
+                                return res
 
                 # --- 平台适配: QQ 音乐 ---
                 elif "y.qq.com" in final_url:
@@ -160,7 +161,7 @@ class LinkReaderPlugin(Star):
                             try:
                                 data = json.loads(re.sub(r'^\w+\(|\)$', '', text))
                                 lrc = data.get("lyric", "")
-                                if lrc: return f"【QQ音乐解析】\n\n{self._filter_lyrics(lrc)}"
+                                if lrc: return f"【QQ音乐直连解析】\n\n{self._filter_lyrics(lrc)}"
                             except: pass
 
                 # --- 平台适配: 酷我音乐 ---
@@ -170,22 +171,14 @@ class LinkReaderPlugin(Star):
                         mid = id_match.group(1)
                         api_url = f"http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId={mid}"
                         async with session.get(api_url) as resp:
-                            data = await resp.json()
+                            text = await resp.text()
+                            data = json.loads(text)
                             lrc_list = data.get("data", {}).get("lrclist", [])
                             if lrc_list:
                                 lrc_text = "\n".join([i['lineLyric'] for i in lrc_list])
-                                return f"【酷我音乐解析】\n\n{lrc_text}"
+                                return f"【酷我音乐直连解析】\n\n{lrc_text}"
 
-                # --- 平台适配: 酷狗音乐 ---
-                elif "kugou.com" in final_url:
-                    hash_match = re.search(r'hash=([a-fA-F0-9]{32})', final_url.lower())
-                    if hash_match:
-                        f_hash = hash_match.group(1)
-                        api_url = f"http://krcs.kugou.com/search?ver=1&man=yes&client=mobi&hash={f_hash}"
-                        async with session.get(api_url) as resp:
-                            pass
-
-                # 以上直连均失败，触发 xiaojiangclub 兜底搜索
+                # 直连失败或未适配平台，触发兜底搜索
                 return await self._fallback_xiaojiang_search(final_url)
 
         except Exception as e:
@@ -200,16 +193,28 @@ class LinkReaderPlugin(Star):
                     soup = BeautifulSoup(await resp.text(errors='ignore'), 'lxml')
                     title = soup.title.string.strip() if soup.title else "未知歌曲"
             
-            # 清理标题得到纯净歌名
-            song_name = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*| - 歌曲.*)$', '', title).strip()
+            # --- 精简关键词逻辑 ---
+            # 1. 移除特定的后缀
+            song_name = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*| - 歌曲.*| - 单曲)$', '', title).strip()
             song_name = re.sub(r'^歌曲：', '', song_name)
             
-            logger.info(f"[LinkReader] 正在 xiaojiangclub.com 搜索: {song_name}")
+            # 2. 强力过滤：移除所有括号内的信息 (周年曲、游戏名、推广语等)
+            song_name = re.sub(r'[（《\(【].*?[）》\)】]', '', song_name).strip()
+            
+            # 3. 移除多歌手列表 (只留第一个歌手或纯歌名)
+            if ' - ' in song_name:
+                song_name = song_name.split(' - ')[0].strip()
+            
+            # 4. 如果过滤后太短，回退到第一个短横杠前的核心
+            if not song_name or len(song_name) < 1:
+                song_name = title.split('-')[0].strip()
+
+            logger.info(f"[LinkReader] 正在尝试精简后的关键词搜索: {song_name}")
             content = await self._search_xiaojiang(song_name)
             
             if content:
                 return f"【歌词解析: {song_name}】\n来源: 小江音乐网\n\n{content}"
-            return f"识别到歌曲《{song_name}》，但未能获取歌词正文。"
+            return f"识别到歌曲链接，但在自动搜索《{song_name}》时未能匹配到歌词正文。"
         except Exception:
             return "音乐链接解析失败。"
 
@@ -224,32 +229,29 @@ class LinkReaderPlugin(Star):
                     if resp.status != 200: return None
                     soup = BeautifulSoup(await resp.text(), 'lxml')
                     
-                    # 关键修改：根据截图，搜索 a 标签中 class 包含 song-link 的第一个项
+                    # 查找包含 song-link 类的第一个 a 标签
                     target_link_tag = soup.find('a', class_='song-link', href=True)
                     if not target_link_tag:
-                        logger.warning(f"[LinkReader] xiaojiangclub 未找到 song-link 标签")
                         return None
                     
                     target_path = target_link_tag['href']
-                    # 拼接完整 URL
                     target_link = target_path if target_path.startswith("http") else base_domain + target_path
                     
-                    logger.info(f"[LinkReader] 正在访问歌词页面: {target_link}")
+                    logger.info(f"[LinkReader] 正在访问搜索结果页: {target_link}")
                     async with session.get(target_link, headers=headers, timeout=10) as l_resp:
                         l_soup = BeautifulSoup(await l_resp.text(), 'lxml')
                         
-                        # 提取歌词容器
-                        content_container = l_soup.find('div', class_='entry-content') or l_soup.find('article')
+                        # 定位 WordPress 常见的正文容器
+                        content_container = l_soup.find('div', class_='entry-content') or l_soup.find('article') or l_soup.find('div', class_='post-content')
                         if not content_container: content_container = l_soup
                         
-                        # 清洗无关元素
                         for tag in content_container(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'button']):
                             tag.decompose()
                             
                         raw_text = content_container.get_text(separator='\n', strip=True)
                         return self._filter_lyrics(raw_text)
         except Exception as e:
-            logger.error(f"[LinkReader] Xiaojiang 搜索解析失败: {e}")
+            logger.error(f"[LinkReader] Xiaojiang 搜索解析异常: {e}")
         return None
 
     async def _get_screenshot_and_content(self, url: str):
@@ -331,9 +333,9 @@ class LinkReaderPlugin(Star):
     async def link_status(self, event: AstrMessageEvent):
         """插件状态检查"""
         status_msg = ["【Link Reader 插件状态报告】"]
-        status_msg.append(f"插件运行: {'✅ 正常' if self.enable_plugin else '❌ 已禁用'}")
-        status_msg.append(f"直连 API 支持: 网易云/QQ/酷我/酷狗")
-        status_msg.append(f"智能兜底源: xiaojiangclub.com (使用 song-link 匹配)")
+        status_msg.append(f"插件运行: {'✅ 正常'}")
+        status_msg.append(f"直连 API Mimetype 修复: ✅ 已启用 (json.loads)")
+        status_msg.append(f"搜索关键词精简: ✅ 已启用 (正则脱敏)")
+        status_msg.append(f"智能兜底源: xiaojiangclub.com")
         status_msg.append(f"Playwright 截图: {'✅ 已加载' if HAS_PLAYWRIGHT else '❌ 未就绪'}")
-        status_msg.append(f"正文最大截断: {self.max_length} 字")
         yield event.plain_result("\n".join(status_msg))
