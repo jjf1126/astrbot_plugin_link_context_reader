@@ -102,8 +102,16 @@ class LinkContextReader(Star):
 
             # 6. 注入到req.text
             # 也可以选择追加到 System Prompt 或 context 中，这里选择追加到 req.text
-            original_query = req.query or ""
-            req.query = f"{injection_text}\n\n[用户原话]: {original_query}"
+            # 修改 messages 列表中的最后一条消息（即当前用户发送的内容）
+            if req.messages:
+                for msg in reversed(req.messages):
+                    if msg.get('role') == 'user':
+                        original_content = msg.get('content', "")
+                        msg['content'] = f"{injection_text}\n\n[用户原话]: {original_content}"
+                        break
+            else:
+                # 如果 messages 为空（防御性编程），则直接添加一条
+                req.messages.append({"role": "user", "content": injection_text})
             
             logger.info(f"[LinkReader] Successfully injected content from {target_url}")
 
