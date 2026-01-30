@@ -184,12 +184,12 @@ class LinkReaderPlugin(Star):
             if not keyword:
                 keyword = url
 
-            # 优化关键词提取：保留歌曲名和歌手
+            # 优化关键词提取：剔除平台后缀及曲名外的多余信息
             keyword = re.sub(r'( - .*| \| .*)$', '', keyword)
             logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
 
             # 第二步：使用 DuckDuckGo 搜索
-            search_query = f"{keyword} 歌词"
+            search_query = f"{keyword}"
             results_text = []
             
             # 适配最新版 duckduckgo_search API
@@ -202,7 +202,7 @@ class LinkReaderPlugin(Star):
             if results_text:
                 return f"【音乐链接智能解析】\n识别歌曲: {keyword}\n\n网络搜索歌词结果:\n" + "\n---\n".join(results_text)
             else:
-                return f"识别到音乐链接: {keyword}，但未在搜索结果中找到具体歌词。"
+                return f"识别到音乐链接: {keyword}，但未在指定的搜索网站中找到具体歌词。"
 
         except Exception as e:
             logger.warning(f"[LinkReader] 音乐智能解析失败: {e}")
@@ -229,7 +229,7 @@ class LinkReaderPlugin(Star):
 
         if content:
             injection = self.prompt_template.format(content=content)
-            # 注入文本
+            # 注入文本到 prompt 属性
             req.prompt += injection
             
             # 如果有截图，以 Base64 格式注入 prompt 实现多模态参考
